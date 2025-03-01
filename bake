@@ -1,0 +1,563 @@
+#!/usr/bin/env python3
+"""bake - macOS System Update Tool
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+import shutil
+import logging
+from datetime import datetime, timedelta
+from multiprocessing import cpu_count
+
+from colorama import Fore, Style, init
+
+__version__ = "1.0.0"
+__author__ = "Chenyang"
+__copyright__ = f"Copyright (c) 2025 {__author__}"
+__license__ = """MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE."""
+
+# Initialize colorama
+init()
+
+# Professional Unicode icons
+ICONS = {
+    "rocket": "\u2192",      # Right arrow (→)
+    "tools": "\u2692",       # Hammer and pick (⚒)
+    "package": "\u25A3",     # Square with bottom right fill (▣)
+    "broom": "\u232B",       # Erase to the left (⌫)
+    "check": "\u2713",       # Check mark (✓)
+    "error": "\u2717",       # Ballot X (✗)
+    "warning": "\u26A0",     # Warning sign (⚠)
+    "hourglass": "\u231B",   # Hourglass (⌛)
+    "star": "\u2605",        # Black star (★)
+    "gear": "\u2699",        # Gear (⚙)
+    "drink": "\u2615",       # Coffee (☕)
+    "download": "\u2193",    # Down arrow (↓)
+    "update": "\u21BB",      # Clockwise open circle arrow (↻)
+    "apple": "\uF8FF",       # Apple logo ()
+    "clock": "\u231A",       # Watch (⌚)
+    "speed": "\u2248"        # Approximately equal (≈)
+}
+
+CONFIG_DIR = os.path.expanduser("~/.config/bake")
+CACHE_DIR = os.path.expanduser("~/.cache/bake")
+LOG_DIR = os.path.expanduser("~/.bake/log")
+LAST_OPTIMIZATION_FILE = os.path.join(CACHE_DIR, "last_optimization.json")
+PACKAGE_BACKUP_FILE = os.path.join(CONFIG_DIR, "packages.json")
+OPTIMIZATION_INTERVAL = 7  # days
+LOG_RETENTION_DAYS = 10
+
+def setup_logging(verbose=False):
+    """Set up logging with timestamped file and clean old logs."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log_file = os.path.join(LOG_DIR, datetime.now().strftime("%Y-%m-%d-%H-%M-%S.log"))
+
+    # Clean up old logs
+    now = time.time()
+    for filename in os.listdir(LOG_DIR):
+        file_path = os.path.join(LOG_DIR, filename)
+        if os.path.isfile(file_path):
+            file_mtime = os.path.getmtime(file_path)
+            if (now - file_mtime) > (LOG_RETENTION_DAYS * 86400):
+                os.remove(file_path)
+
+    logging.basicConfig(
+        filename=log_file,
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+    return log_file if verbose else None
+
+def color_text(text, color, bold=False):
+    """Return colored text."""
+    color_code = getattr(Fore, color.upper(), Fore.WHITE)
+    style_code = Style.BRIGHT if bold else ""
+    return f"{color_code}{style_code}{text}{Style.RESET_ALL}"
+
+def print_header(text, icon="star", color="cyan"):
+    """Print a formatted header."""
+    icon_str = ICONS.get(icon, "")
+    border = "═" * (len(text) + 4)
+    print(f"\n{color_text(border, color, True)}")
+    print(f"{color_text('╠ ', color, True)}{icon_str}  {color_text(text, color, True)}")
+    print(f"{color_text(border, color, True)}")
+    logging.info(f"Header: {text}")
+
+def print_step(text, icon="gear", color="blue", verbose=True):
+    """Print a step with icon and color."""
+    if verbose:
+        print(f"{color_text(ICONS.get(icon, ''), color)}  {text}")
+    logging.info(text)
+
+def print_result(success, text, verbose=True, warning=False):
+    """Print a result with appropriate icon and color."""
+    icon = ICONS["warning"] if warning else (ICONS["check"] if success else ICONS["error"])
+    color = "yellow" if warning else ("green" if success else "red")
+    if verbose or not success or warning:
+        print(f"{color_text(icon, color)}  {color_text(text, color)}")
+    logging.info(f"{'WARNING' if warning else 'SUCCESS' if success else 'ERROR'}: {text}")
+
+def run_command(command, description, verbose=False):
+    """Run a command with output handling."""
+    if verbose:
+        print_step(f"{description}:", "update", "cyan")
+    process = subprocess.Popen(
+        command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        universal_newlines=True, bufsize=1
+    )
+
+    output_lines = []
+    if verbose:
+        for line in process.stdout:
+            line = line.strip()
+            print(f"  {line}")
+            output_lines.append(line)
+            logging.info(line)
+    else:
+        output_lines = [line.strip() for line in process.stdout]
+        for line in output_lines:
+            logging.info(line)
+
+    exit_code = process.wait()
+    success = exit_code == 0
+    result_text = f"{description} completed successfully" if success else f"{description} failed (exit code: {exit_code})"
+
+    if not verbose and not success:
+        print("\nError output:")
+        for line in output_lines[-10:]:
+            print(f"  {line}")
+    print_result(success, result_text, verbose)
+    return success, output_lines
+
+def backup_packages(verbose=False):
+    """Backup list of installed packages."""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    packages = {"brew": [], "cask": [], "mas": [], "timestamp": datetime.now().isoformat()}
+
+    try:
+        packages["brew"] = subprocess.check_output("brew list --formula", shell=True).decode().strip().split()
+    except subprocess.CalledProcessError:
+        if verbose:
+            print_result(False, "Failed to backup brew packages")
+
+    try:
+        packages["cask"] = subprocess.check_output("brew list --cask", shell=True).decode().strip().split()
+    except subprocess.CalledProcessError:
+        if verbose:
+            print_result(False, "Failed to backup cask packages")
+
+    try:
+        mas_output = subprocess.check_output("mas list", shell=True).decode().strip()
+        packages["mas"] = [line.split()[0] for line in mas_output.splitlines()] if mas_output else []
+        if not mas_output and verbose:
+            print_result(True, "No installed MAS apps found", verbose, warning=True)
+    except subprocess.CalledProcessError:
+        if verbose:
+            print_result(False, "Failed to backup MAS packages")
+
+    with open(PACKAGE_BACKUP_FILE, "w") as f:
+        json.dump(packages, f, indent=2)
+
+    if verbose:
+        print_result(True, "Package list backed up successfully")
+
+def list_packages():
+    """List all packages from the backup file."""
+    if not os.path.exists(PACKAGE_BACKUP_FILE):
+        print(color_text(f"{ICONS['error']}  Error: No package backup found at {PACKAGE_BACKUP_FILE}", "red", True))
+        sys.exit(1)
+
+    with open(PACKAGE_BACKUP_FILE, "r") as f:
+        packages = json.load(f)
+
+    print(color_text(f"{ICONS['package']}  Package Backup (Last updated: {packages['timestamp']})", "cyan"))
+    print(color_text("Brew Formulas:", "blue"))
+    for pkg in packages["brew"]:
+        print(f"  {pkg}")
+    print(color_text("Brew Casks:", "blue"))
+    for pkg in packages["cask"]:
+        print(f"  {pkg}")
+    print(color_text("Mac App Store Apps:", "blue"))
+    for pkg in packages["mas"]:
+        print(f"  {pkg}")
+
+def generate_install_command():
+    """Generate installation commands for all packages from the backup."""
+    if not os.path.exists(PACKAGE_BACKUP_FILE):
+        print(color_text(f"{ICONS['error']}  Error: No package backup found at {PACKAGE_BACKUP_FILE}", "red", True))
+        sys.exit(1)
+
+    with open(PACKAGE_BACKUP_FILE, "r") as f:
+        packages = json.load(f)
+
+    commands = []
+    if packages["brew"]:
+        commands.append(f"brew install {' '.join(packages['brew'])}")
+    if packages["cask"]:
+        commands.append(f"brew install --cask {' '.join(packages['cask'])}")
+    if packages["mas"]:
+        commands.append(f"mas install {' '.join(packages['mas'])}")
+
+    if not commands:
+        print(color_text(f"{ICONS['warning']}  No packages found in backup", "yellow"))
+    else:
+        print(color_text(f"{ICONS['package']}  Installation Commands:", "cyan"))
+        for cmd in commands:
+            print(cmd)
+
+def get_timestamp(file_path, key=None):
+    """Get timestamp from a JSON file."""
+    if not os.path.exists(file_path):
+        return "Never"
+    try:
+        with open(file_path, "r") as f:
+            data = json.load(f)
+            timestamp = data.get("last_run" if key is None else key, "Unknown")
+            return datetime.fromisoformat(timestamp).strftime("%Y-%m-%d %H:%M:%S")
+    except (json.JSONDecodeError, ValueError):
+        return "Unknown"
+
+def need_optimization():
+    """Check if git optimization is needed."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    if not os.path.exists(LAST_OPTIMIZATION_FILE):
+        return True
+    try:
+        with open(LAST_OPTIMIZATION_FILE, "r") as f:
+            data = json.load(f)
+        last_run = datetime.fromisoformat(data.get("last_run", "2000-01-01"))
+        return (datetime.now() - last_run) > timedelta(days=OPTIMIZATION_INTERVAL)
+    except (json.JSONDecodeError, ValueError):
+        return True
+
+def update_optimization_timestamp():
+    """Update the git optimization timestamp."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(LAST_OPTIMIZATION_FILE, "w") as f:
+        json.dump({"last_run": datetime.now().isoformat()}, f)
+
+def optimize_git_repo(repo_path, verbose=False, output_lock=None):
+    """Optimize a single git repository."""
+    if not os.path.isdir(os.path.join(repo_path, ".git")):
+        return False
+
+    with output_lock:
+        if verbose:
+            print_step(f"Optimizing git repo: {repo_path}", "gear", "blue")
+
+    original_dir = os.getcwd()
+    os.chdir(repo_path)
+
+    threads = max(4, cpu_count() - 1)
+    cache_limit = 512  # MB
+    git_commands = [
+        f"git config --local pack.threads {threads}",
+        f"git config --local grep.threads {threads}",
+        f"git config --local index.threads {threads}",
+        f"git config --local fetch.parallel {threads}",
+        "git config --local core.compression 9",
+        f"git config --local core.deltaBaseCacheLimit {cache_limit}m",
+        "git config --local gc.auto 256",
+        "git config --local gc.autoPackLimit 64",
+        f"git config --local http.postBuffer {cache_limit}m",
+        "git config --local receive.autoGc false",
+        "git config --local repack.writeBitmaps true",
+        "git gc --aggressive --prune=now",
+    ]
+
+    success = True
+    for cmd in git_commands:
+        try:
+            subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except subprocess.CalledProcessError:
+            success = False
+
+    os.chdir(original_dir)
+    return success
+
+def optimize_homebrew_parallel(verbose=False):
+    """Optimize Homebrew git repositories in parallel."""
+    output_lock = threading.Lock()
+
+    if not need_optimization():
+        with output_lock:
+            if verbose:
+                print_step("Git optimization skipped (last run within 7 days)", "clock", "yellow")
+        return
+
+    with output_lock:
+        if verbose:
+            print_header("Optimizing Git Repositories", "tools", "magenta")
+
+    try:
+        brew_prefix = subprocess.check_output("brew --prefix", shell=True).decode().strip()
+    except subprocess.CalledProcessError:
+        with output_lock:
+            if verbose:
+                print_result(False, "Failed to get Homebrew prefix", verbose)
+        return
+
+    repos = [os.path.join(brew_prefix, "Homebrew")]
+    tap_path = os.path.join(brew_prefix, "Homebrew", "Library", "Taps")
+    if os.path.exists(tap_path):
+        for vendor in os.listdir(tap_path):
+            vendor_path = os.path.join(tap_path, vendor)
+            if os.path.isdir(vendor_path):
+                repos.extend(os.path.join(vendor_path, repo_name) for repo_name in os.listdir(vendor_path)
+                            if os.path.isdir(os.path.join(vendor_path, repo_name, ".git")))
+
+    valid_repos = [repo for repo in repos if os.path.isdir(os.path.join(repo, ".git"))]
+    if not valid_repos:
+        with output_lock:
+            if verbose:
+                print_result(False, "No valid git repositories found", verbose)
+        return
+
+    with output_lock:
+        if verbose:
+            print_step(f"Found {len(valid_repos)} git repositories to optimize", "package", "cyan")
+
+    threads = [threading.Thread(target=optimize_git_repo, args=(repo, verbose, output_lock)) for repo in valid_repos]
+    for thread in threads:
+        thread.start()
+
+    with output_lock:
+        if verbose:
+            print_step("Optimizing repositories in parallel...", "speed", "yellow")
+            for thread in threads:
+                thread.join()
+        else:
+            for thread in threads:
+                thread.join()
+
+    with output_lock:
+        if verbose:
+            print_result(True, f"Optimized {len(valid_repos)} git repositories", verbose)
+    update_optimization_timestamp()
+
+def run_parallel_commands(commands, verbose=False):
+    """Run commands in parallel."""
+    results = []
+    threads = []
+    output_lock = threading.Lock()
+
+    if verbose:
+        for cmd, desc, _ in commands:
+            result, output = run_command(cmd, desc, verbose)
+            results.append((result, desc, output))
+    else:
+        from tqdm import tqdm
+        with tqdm(total=len(commands), ncols=80, bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]") as pbar:
+            def run_and_update(cmd, desc, idx):
+                with output_lock:
+                    result, output = run_command(cmd, desc, False)
+                    results.append((result, desc, output))
+                    pbar.update(1)
+
+            for i, (cmd, desc, _) in enumerate(commands):
+                thread = threading.Thread(target=run_and_update, args=(cmd, desc, i))
+                thread.start()
+                threads.append(thread)
+                time.sleep(0.2)
+
+            for thread in threads:
+                thread.join()
+
+    return results
+
+def update_system(verbose=False, force_git_optimization=False):
+    """Run system update commands."""
+    log_file = setup_logging(verbose)
+    start_time = time.time()
+    print_header("macOS SYSTEM UPDATE", "apple", "green")
+    if verbose and log_file:
+        print_step(f"Logging to: {log_file}", "gear", "blue")
+
+    if force_git_optimization and os.path.exists(LAST_OPTIMIZATION_FILE):
+        os.remove(LAST_OPTIMIZATION_FILE)
+
+    backup_packages(verbose)
+    optimization_thread = threading.Thread(target=optimize_homebrew_parallel, args=(verbose,))
+    optimization_thread.start()
+
+    sequential_commands = [
+        ("sudo softwareupdate -d", "Downloading macOS software updates", "download"),
+        ("brew update", "Updating Homebrew package database", "update"),
+    ]
+
+    parallel_commands = [
+        ("mas upgrade", "Upgrading Mac App Store applications", "package"),
+        ("brew upgrade", "Upgrading Homebrew packages", "package"),
+        ("brew upgrade --cask", "Upgrading Homebrew cask packages", "package"),
+    ]
+
+    cleanup_commands = [
+        ("brew cleanup -s --prune=all -q", "Cleaning up Homebrew", "broom"),
+        ("brew missing", "Checking for missing dependencies", "gear"),
+    ]
+
+    total_steps = len(sequential_commands) + len(parallel_commands) + len(cleanup_commands)
+    print_header(f"UPDATE SEQUENCE: {total_steps} STEPS", "rocket", "blue")
+
+    for cmd, desc, icon in sequential_commands:
+        run_command(cmd, desc, verbose)
+
+    print_step("Running parallel upgrade operations...", "speed", "yellow", verbose)
+    run_parallel_commands(parallel_commands, verbose)
+
+    for cmd, desc, icon in cleanup_commands:
+        run_command(cmd, desc, verbose)
+
+    if optimization_thread.is_alive():
+        if verbose:
+            print_step("Waiting for background optimization to complete...", "hourglass", "yellow")
+        optimization_thread.join()
+
+    print_header("UPDATE COMPLETE", "check", "green")
+    total_time = time.time() - start_time
+    minutes, seconds = divmod(int(total_time), 60)
+    print(f"{color_text(ICONS['drink'], 'cyan')}  All done! Your Mac is now up to date. Total time: {minutes}m {seconds}s")
+
+def generate_completion_script(shell):
+    """Generate completion script for the specified shell."""
+    try:
+        import argcomplete
+        if shell == "bash":
+            print('eval "$(register-python-argcomplete bake)"')
+            print("# Add this line to your ~/.bashrc and source it")
+        elif shell == "zsh":
+            print('autoload -U +X bashcompinit && bashcompinit')
+            print('eval "$(register-python-argcomplete bake)"')
+            print("# Add these lines to your ~/.zshrc and source it")
+        elif shell == "fish":
+            print("register-python-argcomplete --shell fish bake | source")
+            print("# Add this line to your ~/.config/fish/config.fish or run it manually")
+        else:
+            print(f"Unsupported shell: {shell}")
+            sys.exit(1)
+        sys.exit(0)
+    except ImportError:
+        print("Error: argcomplete is required for shell completion. Install it with 'pip3 install argcomplete --user'")
+        sys.exit(1)
+
+def main():
+    """Main entry point for bake."""
+    parser = argparse.ArgumentParser(
+        description=f"bake - macOS System Update Tool\n\n{__copyright__}",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("-v", "--version", action="version", version=f"bake {__version__}")
+    parser.add_argument("--completion", choices=["bash", "zsh", "fish"],
+                        help="Generate shell completion script for the specified shell")
+    parser.add_argument("--license", action="store_true",
+                        help="Display the license information")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # Update command
+    update_parser = subparsers.add_parser("up", help="Update the system")
+    update_parser.add_argument("-v", "--verbose", action="store_true", help="Show detailed output")
+    update_parser.add_argument("-f", "--force", action="store_true", help="Force git repository optimization")
+
+    # Show command
+    show_parser = subparsers.add_parser("show", help="Show timestamps or package information")
+    show_subparsers = show_parser.add_subparsers(dest="show_type")
+    show_timestamp_parser = show_subparsers.add_parser("timestamp", help="Show timestamps")
+    show_timestamp_parser.add_argument("type", choices=["package", "optimization"],
+                                       help="Show 'package' for last package update or 'optimization' for last git optimization")
+    show_packages_parser = show_subparsers.add_parser("packages", help="List backed-up packages")
+    show_install_parser = show_subparsers.add_parser("install", help="Generate installation commands for backed-up packages")
+
+    args = parser.parse_args()
+
+    if args.license:
+        print(f"{__copyright__}\n\n{__license__}")
+        sys.exit(0)
+
+    if args.completion:
+        generate_completion_script(args.completion)
+
+    if not args.command:
+        print(f"bake {__version__}")
+        sys.exit(0)
+
+    if sys.platform != "darwin":
+        print(color_text(f"{ICONS['error']}  Error: This script runs only on macOS.", "red", True))
+        sys.exit(1)
+
+    required_tools = ["brew", "mas"]
+    missing_tools = [tool for tool in required_tools if not shutil.which(tool)]
+    if missing_tools:
+        print(color_text(f"{ICONS['error']}  Error: Missing tools: {', '.join(missing_tools)}", "red", True))
+        if "brew" in missing_tools:
+            print(color_text(f"{ICONS['warning']}  Install Homebrew: /bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"", "yellow"))
+        if "mas" in missing_tools:
+            print(color_text(f"{ICONS['warning']}  Install MAS CLI: brew install mas", "yellow"))
+        sys.exit(1)
+
+    if args.command == "show":
+        if args.show_type == "timestamp":
+            timestamp = get_timestamp(PACKAGE_BACKUP_FILE, "timestamp") if args.type == "package" else get_timestamp(LAST_OPTIMIZATION_FILE)
+            print(f"{color_text(ICONS['clock'], 'yellow')}  Last {'package update' if args.type == 'package' else 'git optimization'}: {timestamp}")
+        elif args.show_type == "packages":
+            list_packages()
+        elif args.show_type == "install":
+            generate_install_command()
+        sys.exit(0)
+
+    if args.command == "up":
+        if args.verbose and os.geteuid() != 0:
+            print(color_text(f"{ICONS['warning']}  Note: Some commands need sudo. You may be prompted for a password.", "yellow"))
+        try:
+            update_system(args.verbose, args.force)
+        except KeyboardInterrupt:
+            print(color_text(f"\n{ICONS['warning']}  Update interrupted by user.", "yellow", True))
+            sys.exit(1)
+        except Exception as e:
+            print(color_text(f"\n{ICONS['error']}  Error: {str(e)}", "red", True))
+            sys.exit(1)
+
+if __name__ == "__main__":
+    main()

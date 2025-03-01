@@ -1,0 +1,5 @@
+argparse==1.4.0
+colorama==0.4.6
+cpu-count==1.0.0
+datetime==5.5
+timedelta==2020.12.3
